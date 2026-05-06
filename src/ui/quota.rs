@@ -176,12 +176,17 @@ fn draw_source_column(
             Style::default().fg(c),
         ));
         lines.push(Line::from(s));
-        if !reset.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("  {}", reset),
-                Style::default().fg(theme.graph_text),
-            )));
-        }
+        // Always reserve the row so both columns line up vertically;
+        // when there's nothing meaningful to show (stale source or the
+        // cached reset moment is past), render it blank.
+        lines.push(Line::from(Span::styled(
+            if reset.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", reset)
+            },
+            Style::default().fg(theme.graph_text),
+        )));
     }
     if let Some(used_pct) = rl.seven_day_pct {
         let remaining = (100.0 - used_pct).clamp(0.0, 100.0);
@@ -204,12 +209,17 @@ fn draw_source_column(
             Style::default().fg(c),
         ));
         lines.push(Line::from(s));
-        if !reset.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("  {}", reset),
-                Style::default().fg(theme.graph_text),
-            )));
-        }
+        // Always reserve the row so both columns line up vertically;
+        // when there's nothing meaningful to show (stale source or the
+        // cached reset moment is past), render it blank.
+        lines.push(Line::from(Span::styled(
+            if reset.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", reset)
+            },
+            Style::default().fg(theme.graph_text),
+        )));
     }
 
     f.render_widget(Paragraph::new(lines), area);
