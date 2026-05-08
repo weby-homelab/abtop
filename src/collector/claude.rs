@@ -1688,6 +1688,24 @@ fn context_window_for_model(transcript_model: &str, configured_model: &str, max_
     }
 }
 
+/// Returns the ordered list of Claude Code settings files to check, from
+/// highest to lowest priority, matching Claude Code's own resolution order:
+/// 1. `{cwd}/.claude/settings.local.json`
+/// 2. `{cwd}/.claude/settings.json`
+/// 3. `~/.claude/settings.local.json`
+/// 4. `~/.claude/settings.json`
+fn settings_candidate_paths(cwd: &str) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let cwd_path = PathBuf::from(cwd);
+    candidates.push(cwd_path.join(".claude").join("settings.local.json"));
+    candidates.push(cwd_path.join(".claude").join("settings.json"));
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".claude").join("settings.local.json"));
+        candidates.push(home.join(".claude").join("settings.json"));
+    }
+    candidates
+}
+
 /// Read the persistent `effortLevel` for a Claude Code session.
 ///
 /// Precedence (highest wins), matching Claude Code's own resolution order:
@@ -1708,16 +1726,7 @@ fn read_effort_level(cwd: &str) -> String {
         }
     }
 
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    let cwd_path = PathBuf::from(cwd);
-    candidates.push(cwd_path.join(".claude").join("settings.local.json"));
-    candidates.push(cwd_path.join(".claude").join("settings.json"));
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join(".claude").join("settings.local.json"));
-        candidates.push(home.join(".claude").join("settings.json"));
-    }
-
-    for path in candidates {
+    for path in settings_candidate_paths(cwd) {
         if let Some(level) = read_effort_from_settings(&path) {
             return level;
         }
@@ -1736,16 +1745,27 @@ fn read_effort_from_settings(path: &Path) -> Option<String> {
     }
 }
 
+/// Read the configured model from Claude Code's settings files.
+///
+/// Precedence (highest wins), matching Claude Code's own resolution order:
+/// 1. `CLAUDE_CODE_MODEL` env var (abtop's own env — only visible when
+///    set in the user's shell before launching both abtop and claude)
+/// 2. `{cwd}/.claude/settings.local.json`
+/// 3. `{cwd}/.claude/settings.json`
+/// 4. `~/.claude/settings.local.json`
+/// 5. `~/.claude/settings.json`
+///
+/// Returns an empty string when no model is configured. The value may include
+/// the `[1m]` suffix (e.g. `"sonnet[1m]"`) which is used to detect 1M context.
 fn read_configured_model(cwd: &str) -> String {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    let cwd_path = PathBuf::from(cwd);
-    candidates.push(cwd_path.join(".claude").join("settings.local.json"));
-    candidates.push(cwd_path.join(".claude").join("settings.json"));
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join(".claude").join("settings.local.json"));
-        candidates.push(home.join(".claude").join("settings.json"));
+    if let Ok(v) = std::env::var("CLAUDE_CODE_MODEL") {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
     }
-    for path in candidates {
+
+    for path in settings_candidate_paths(cwd) {
         if let Some(model) = read_model_from_settings(&path) {
             return model;
         }
