@@ -452,6 +452,7 @@ impl ClaudeCollector {
             total_cache_create: 0,
             last_context_tokens: 0,
             max_context_tokens: 0,
+            prev_cache_read: 0,
             context_history: Vec::new(),
             compaction_count: 0,
             turn_count: 0,
@@ -1149,6 +1150,8 @@ struct TranscriptResult {
     last_context_tokens: u64,
     /// High-water mark: largest context seen in any turn (for 1M detection)
     max_context_tokens: u64,
+    /// cache_read from the previous turn (for compaction detection)
+    prev_cache_read: u64,
     /// Per-turn context sizes for evolution visualization.
     context_history: Vec<u64>,
     /// Detected compaction events (context dropped > 30% between consecutive turns).
@@ -1238,6 +1241,7 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
         total_cache_create: 0,
         last_context_tokens: 0,
         max_context_tokens: 0,
+        prev_cache_read: 0,
         context_history: Vec::new(),
         compaction_count: 0,
         turn_count: 0,
@@ -1390,11 +1394,18 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                         result.max_context_tokens = result.last_context_tokens;
                                     }
                                     // Detect compaction: context drops > 30% between turns
+                                    // AND cache_read drops hard (old cache invalidated).
+                                    // This avoids false positives from normal cache hit rate
+                                    // fluctuations where total context varies but no
+                                    // actual conversation truncation occurred.
                                     if prev_context > 0
                                         && result.last_context_tokens < prev_context * 7 / 10
+                                        && result.prev_cache_read > 1000
+                                        && cr < result.prev_cache_read / 5
                                     {
                                         result.compaction_count += 1;
                                     }
+                                    result.prev_cache_read = cr;
                                     if result.context_history.len() < 10_000 {
                                         result.context_history.push(result.last_context_tokens);
                                     }
