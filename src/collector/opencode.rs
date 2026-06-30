@@ -253,9 +253,14 @@ impl OpenCodeCollector {
                 "-".to_string()
             };
 
-            let context_window = context_window_for_model(&model, "", 0);
+            // Fetch the context limit from the local configuration file (~/.config/opencode/opencode.jsonc)
+            // falling back to context_window_for_model if missing.
+            let context_window = get_context_window_from_config(&ds.provider, &ds.model)
+                .unwrap_or_else(|| context_window_for_model(&model, "", 0));
+
+            // Calculate context percent on active context size (latest turn's tokens.total), not cumulative sum.
             let context_percent = if context_window > 0 {
-                ((ds.total_input + ds.total_output) as f64 / context_window as f64) * 100.0
+                (ds.last_total_tokens as f64 / context_window as f64) * 100.0
             } else {
                 0.0
             };
@@ -466,7 +471,12 @@ SELECT
     ORDER BY m2.time_created DESC LIMIT 1), '') as last_role,
   (SELECT json_extract(m2.data, '$.time.completed')
     FROM message m2 WHERE m2.session_id = s.id
-    ORDER BY m2.time_created DESC LIMIT 1) as last_completed
+    ORDER BY m2.time_created DESC LIMIT 1) as last_completed,
+  COALESCE((SELECT json_extract(m2.data, '$.tokens.total')
+    FROM message m2 WHERE m2.session_id = s.id
+    AND json_extract(m2.data, '$.role') = 'assistant'
+    AND json_extract(m2.data, '$.tokens.total') IS NOT NULL
+    ORDER BY m2.time_created DESC LIMIT 1), 0) as last_total_tokens
 FROM session s
 ORDER BY s.time_updated DESC
 LIMIT {};"#,
@@ -478,7 +488,7 @@ LIMIT {};"#,
         let model_rows = self.run_query(&model_sql).unwrap_or_default();
 
         // Build model lookup by session id
-        let mut model_map: HashMap<String, (String, String, String, Option<u64>)> = HashMap::new();
+        let mut model_map: HashMap<String, (String, String, String, Option<u64>, u64)> = HashMap::new();
         for mr in &model_rows {
             if let Some(id) = mr["id"].as_str() {
                 model_map.insert(
@@ -488,6 +498,7 @@ LIMIT {};"#,
                         sanitize_db_field(mr["provider"].as_str().unwrap_or(""), 256),
                         sanitize_db_field(mr["last_role"].as_str().unwrap_or(""), 64),
                         mr["last_completed"].as_u64(),
+                        mr["last_total_tokens"].as_u64().unwrap_or(0),
                     ),
                 );
             }
@@ -496,9 +507,9 @@ LIMIT {};"#,
         let mut sessions = Vec::new();
         for row in rows {
             let id = row["id"].as_str().unwrap_or("").to_string();
-            let (model, provider, last_role, last_completed) = model_map
+            let (model, provider, last_role, last_completed, last_total_tokens) = model_map
                 .remove(&id)
-                .unwrap_or_else(|| ("".to_string(), "".to_string(), "".to_string(), None));
+                .unwrap_or_else(|| ("".to_string(), "".to_string(), "".to_string(), None, 0));
 
             // Sanitize DB-sourced strings before they reach the TUI/JSON snapshot.
             let title = sanitize_db_title(row["title"].as_str().unwrap_or(""));
@@ -523,6 +534,7 @@ LIMIT {};"#,
                 provider,
                 last_role,
                 last_completed,
+                last_total_tokens,
             });
         }
 
@@ -700,6 +712,95 @@ fn get_git_branch(cwd: &str) -> String {
     String::new()
 }
 
+/// Strip jsonc single-line and multi-line comments.
+fn strip_jsonc_comments(content: &str) -> String {
+    let mut clean = String::new();
+    let mut in_block_comment = false;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut lines = content.lines().peekable();
+    
+    while let Some(line) = lines.next() {
+        let mut line_clean = String::new();
+        let mut chars = line.chars().peekable();
+        
+        while let Some(c) = chars.next() {
+            if in_block_comment {
+                if c == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    in_block_comment = false;
+                }
+            } else if in_string {
+                line_clean.push(c);
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+            } else if c == '"' {
+                in_string = true;
+                line_clean.push(c);
+            } else if c == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                in_block_comment = true;
+            } else if c == '/' && chars.peek() == Some(&'/') {
+                break;
+            } else {
+                line_clean.push(c);
+            }
+        }
+        
+        if !in_block_comment {
+            clean.push_str(&line_clean);
+            clean.push('\n');
+        }
+    }
+    clean
+}
+
+/// Resolve context limit from opencode.jsonc config file.
+fn get_context_window_from_config(provider: &str, model_id: &str) -> Option<u64> {
+    let config_dir = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .map(|h| h.join(".config"))
+                .unwrap_or_default()
+        });
+    #[allow(unused_mut)]
+    let mut config_path = config_dir.join("opencode").join("opencode.jsonc");
+    
+    #[cfg(target_os = "windows")]
+    if !config_path.exists() {
+        for var in ["LOCALAPPDATA", "APPDATA"] {
+            if let Ok(base) = std::env::var(var) {
+                if !base.is_empty() {
+                    let candidate = PathBuf::from(base).join("opencode").join("opencode.jsonc");
+                    if candidate.exists() {
+                        config_path = candidate;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if !config_path.exists() {
+        return None;
+    }
+    let content = fs::read_to_string(&config_path).ok()?;
+    let clean_json = strip_jsonc_comments(&content);
+    let val: serde_json::Value = serde_json::from_str(&clean_json).ok()?;
+    
+    if let Some(context_limit) = val["provider"][provider]["models"][model_id]["limit"]["context"].as_u64() {
+        return Some(context_limit);
+    }
+    
+    None
+}
+
 struct DbSession {
     id: String,
     title: String,
@@ -716,6 +817,7 @@ struct DbSession {
     provider: String,
     last_role: String,
     last_completed: Option<u64>,
+    last_total_tokens: u64,
 }
 
 /// Check if a path is a symlink (fail-closed: returns true on error).
