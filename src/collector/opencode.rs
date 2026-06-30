@@ -511,9 +511,8 @@ LIMIT {};"#,
                 title,
                 directory,
                 version,
-                // time_created and time_updated are in milliseconds since epoch
+                // time_created is in milliseconds since epoch
                 time_created: row["time_created"].as_u64().unwrap_or(0),
-                time_updated: row["time_updated"].as_u64().unwrap_or(0),
                 project_name,
                 turn_count: row["turn_count"].as_u64().unwrap_or(0) as u32,
                 total_input: row["total_input"].as_u64().unwrap_or(0),
@@ -545,13 +544,11 @@ LIMIT {};"#,
         let rows = self.run_query(&sql)?;
         let mut subagents = Vec::new();
         for row in rows {
-            let id = row["id"].as_str().unwrap_or("").to_string();
             let parent_id = row["parent_id"].as_str().unwrap_or("").to_string();
             let title = sanitize_db_title(row["title"].as_str().unwrap_or(""));
             let tokens = row["tokens"].as_u64().unwrap_or(0);
             let time_updated = row["time_updated"].as_u64().unwrap_or(0);
             subagents.push(DbSubAgent {
-                id,
                 parent_id,
                 title,
                 tokens,
@@ -661,7 +658,6 @@ impl super::AgentCollector for OpenCodeCollector {
 }
 
 struct DbSubAgent {
-    id: String,
     parent_id: String,
     title: String,
     tokens: u64,
@@ -710,7 +706,6 @@ struct DbSession {
     directory: String,
     version: String,
     time_created: u64,
-    time_updated: u64,
     project_name: String,
     turn_count: u32,
     total_input: u64,
