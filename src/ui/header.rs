@@ -14,7 +14,7 @@ pub(crate) fn draw_header(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let now = chrono::Local::now().format("%H:%M").to_string();
     let version = env!("CARGO_PKG_VERSION");
 
-    let title = format!(" abtop v{version} ");
+    let title = format!(" llm-top v{version} ");
     let right = format!(" {now}  {active}↑ {session_count}● ");
 
     let host_str = app.host_metrics.as_ref().map(fmt_host);

@@ -52,7 +52,7 @@ impl Default for AppConfig {
 }
 
 fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("abtop").join("config.toml"))
+    dirs::config_dir().map(|d| d.join("llm-top").join("config.toml"))
 }
 
 pub fn load_config() -> AppConfig {

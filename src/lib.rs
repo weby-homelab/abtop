@@ -1,4 +1,4 @@
-//! abtop — AI agent monitor.
+//! llm-top — local LLM and agent monitor.
 //!
 //! This crate is both a binary (the TUI, entered via [`run`]) and a library.
 //! The library surface exists so a separate local tool (e.g. a web UI) can
@@ -32,8 +32,8 @@
 //! # Typical usage
 //!
 //! ```no_run
-//! use abtop::app::App;
-//! use abtop::{config, theme::Theme};
+//! use llm_top::app::App;
+//! use llm_top::{config, theme::Theme};
 //!
 //! let cfg = config::load_config();
 //! let mut app = App::new_with_config_and_claude_dirs(
@@ -91,7 +91,7 @@ fn build_app(theme: theme::Theme, cfg: &config::AppConfig) -> App {
 pub fn run() -> io::Result<()> {
     // --version / -V flag: print version and exit
     if std::env::args().any(|a| a == "--version" || a == "-V") {
-        println!("abtop {}", env!("CARGO_PKG_VERSION"));
+        println!("llm-top {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
@@ -399,7 +399,7 @@ fn sanitize_output(s: &str) -> String {
 
 fn print_snapshot(app: &App) {
     println!(
-        "abtop — {} sessions, {} mcp servers\n",
+        "llm-top — {} sessions, {} mcp servers\n",
         app.sessions.len(),
         app.mcp_servers.len()
     );
@@ -482,12 +482,12 @@ fn print_snapshot(app: &App) {
 
 fn run_update() -> io::Result<()> {
     let current = env!("CARGO_PKG_VERSION");
-    println!("abtop v{current} — checking for updates...\n");
+    println!("llm-top v{current} — checking for updates...\n");
 
     // Download to a private temp file (O_EXCL + random suffix) so a local
     // attacker can't pre-place a symlink or swap the file mid-run.
     let tmp = tempfile::Builder::new()
-        .prefix("abtop-installer-")
+        .prefix("llm-top-installer-")
         .suffix(".sh")
         .tempfile()?;
     let installer_path = tmp.path().to_path_buf();
@@ -498,7 +498,7 @@ fn run_update() -> io::Result<()> {
             "=https",
             "--tlsv1.2",
             "-LsSf",
-            "https://github.com/graykode/abtop/releases/latest/download/abtop-installer.sh",
+            "https://github.com/weby-homelab/llm-top/releases/latest/download/llm-top-installer.sh",
             "-o",
         ])
         .arg(&installer_path)
@@ -506,7 +506,7 @@ fn run_update() -> io::Result<()> {
 
     if !dl_status.success() {
         eprintln!("\nDownload failed. You can also update manually:");
-        eprintln!("  cargo install abtop --force");
+        eprintln!("  cargo install llm-top --force");
         std::process::exit(1);
     }
 
@@ -534,7 +534,7 @@ fn run_update() -> io::Result<()> {
 
     if !status.success() {
         eprintln!("\nUpdate failed. You can also update manually:");
-        eprintln!("  cargo install abtop --force");
+        eprintln!("  cargo install llm-top --force");
         std::process::exit(1);
     }
 

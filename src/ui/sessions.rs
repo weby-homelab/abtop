@@ -134,9 +134,10 @@ pub(crate) fn draw_sessions_panel_active(
         let marker = if selected { "►" } else { " " };
 
         let (agent_label, agent_color) = match session.agent_cli {
-            "claude"   => ("*CC", Color::Rgb(217, 119, 87)),  // #D97757 terracotta
-            "codex"    => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
-            "opencode" => ("#OC", Color::Rgb(74, 222, 128)),  // #4ADE80 emerald
+            "ollama"    => ("OLM", Color::Rgb(235, 178, 50)),  // warm gold
+            "llama.cpp" => ("LLC", Color::Rgb(168, 122, 255)), // vibrant purple
+            "vllm"      => ("VLM", Color::Rgb(50, 178, 235)),  // light blue
+            "opencode"  => ("#OC", Color::Rgb(74, 222, 128)),  // emerald green
             other => {
                 let fallback: String = other.chars().take(3).collect::<String>().to_uppercase();
                 (
