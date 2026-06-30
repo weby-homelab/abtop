@@ -5,6 +5,8 @@ pub mod rate_limit;
 pub mod ollama;
 pub mod llama_cpp;
 pub mod vllm;
+pub mod odysseus;
+pub mod auto_discover;
 
 pub use mcp::McpServer;
 pub use opencode::OpenCodeCollector;
@@ -12,6 +14,8 @@ pub use rate_limit::read_rate_limits;
 pub use ollama::OllamaCollector;
 pub use llama_cpp::LlamaCppCollector;
 pub use vllm::VllmCollector;
+pub use odysseus::OdysseusCollector;
+pub use auto_discover::AutoDiscoverCollector;
 
 /// Abbreviate a filesystem path by replacing the home directory prefix with `~`.
 pub(crate) fn abbrev_path(path: &std::path::Path) -> String {
@@ -338,6 +342,12 @@ impl MultiCollector {
         if !is_hidden("opencode") {
             collectors.push(Box::new(OpenCodeCollector::new()));
         }
+        if !is_hidden("odysseus") {
+            collectors.push(Box::new(OdysseusCollector::new()));
+        }
+        if !is_hidden("auto") {
+            collectors.push(Box::new(AutoDiscoverCollector::new()));
+        }
         let codex_enabled = false;
         Self {
             collectors,
@@ -504,27 +514,27 @@ mod tests {
     #[test]
     fn with_hidden_empty_keeps_all_collectors() {
         let mc = MultiCollector::with_hidden(&[]);
-        assert_eq!(mc.collectors.len(), 4);
+        assert_eq!(mc.collectors.len(), 6);
     }
 
     #[test]
     fn with_hidden_ollama_drops_ollama_only() {
         let mc = MultiCollector::with_hidden(&["ollama".to_string()]);
-        assert_eq!(mc.collectors.len(), 3);
+        assert_eq!(mc.collectors.len(), 5);
     }
 
     #[test]
     fn with_hidden_is_case_insensitive() {
         let mc = MultiCollector::with_hidden(&["OLLAMA".to_string()]);
-        assert_eq!(mc.collectors.len(), 3);
+        assert_eq!(mc.collectors.len(), 5);
         let mc = MultiCollector::with_hidden(&["Llama.cpp".to_string()]);
-        assert_eq!(mc.collectors.len(), 3);
+        assert_eq!(mc.collectors.len(), 5);
     }
 
     #[test]
     fn with_hidden_unknown_names_are_ignored() {
         let mc = MultiCollector::with_hidden(&["kiro".to_string(), "gemini".to_string()]);
-        assert_eq!(mc.collectors.len(), 4);
+        assert_eq!(mc.collectors.len(), 6);
     }
 
     #[test]
@@ -534,6 +544,8 @@ mod tests {
             "llama.cpp".to_string(),
             "vllm".to_string(),
             "opencode".to_string(),
+            "odysseus".to_string(),
+            "auto".to_string(),
         ]);
         assert!(mc.collectors.is_empty());
     }

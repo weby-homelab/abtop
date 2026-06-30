@@ -138,6 +138,8 @@ pub(crate) fn draw_sessions_panel_active(
             "llama.cpp" => ("LLC", Color::Rgb(168, 122, 255)), // vibrant purple
             "vllm"      => ("VLM", Color::Rgb(50, 178, 235)),  // light blue
             "opencode"  => ("#OC", Color::Rgb(74, 222, 128)),  // emerald green
+            "odysseus"  => ("ODY", Color::Rgb(255, 140, 66)),  // warm orange
+            "auto"      => ("API", Color::Rgb(200, 200, 200)), // silver/grey
             other => {
                 let fallback: String = other.chars().take(3).collect::<String>().to_uppercase();
                 (
