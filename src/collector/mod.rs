@@ -1,15 +1,17 @@
-pub mod claude;
-pub mod codex;
 pub mod mcp;
 pub mod opencode;
 pub mod process;
 pub mod rate_limit;
+pub mod ollama;
+pub mod llama_cpp;
+pub mod vllm;
 
-pub use claude::ClaudeCollector;
-pub use codex::CodexCollector;
 pub use mcp::McpServer;
 pub use opencode::OpenCodeCollector;
 pub use rate_limit::read_rate_limits;
+pub use ollama::OllamaCollector;
+pub use llama_cpp::LlamaCppCollector;
+pub use vllm::VllmCollector;
 
 /// Abbreviate a filesystem path by replacing the home directory prefix with `~`.
 pub(crate) fn abbrev_path(path: &std::path::Path) -> String {
@@ -136,6 +138,22 @@ pub struct SharedProcessData {
     /// Cached Desktop app-server PID -> open rollout files. This is populated
     /// by a background scanner so slow macOS lsof calls cannot block the TUI.
     pub desktop_rollout_fd_map: HashMap<u32, Vec<PathBuf>>,
+}
+
+/// Context window size for this model (e.g. 200K, 1M).
+pub(crate) fn context_window_for_model(
+    transcript_model: &str,
+    configured_model: &str,
+    max_context_tokens: u64,
+) -> u64 {
+    if transcript_model.contains("[1m]")
+        || configured_model.contains("[1m]")
+        || max_context_tokens > 200_000
+    {
+        1_000_000
+    } else {
+        200_000
+    }
 }
 
 impl SharedProcessData {
@@ -304,22 +322,23 @@ impl MultiCollector {
 
     pub fn with_hidden_and_claude_config_dirs(
         hidden: &[String],
-        claude_config_dirs: &[PathBuf],
+        _claude_config_dirs: &[PathBuf],
     ) -> Self {
         let is_hidden = |name: &str| hidden.iter().any(|h| h.eq_ignore_ascii_case(name));
         let mut collectors: Vec<Box<dyn AgentCollector>> = Vec::new();
-        if !is_hidden("claude") {
-            collectors.push(Box::new(ClaudeCollector::with_configured_dirs(
-                claude_config_dirs.to_vec(),
-            )));
+        if !is_hidden("ollama") {
+            collectors.push(Box::new(OllamaCollector::new()));
         }
-        if !is_hidden("codex") {
-            collectors.push(Box::new(CodexCollector::new()));
+        if !is_hidden("llama.cpp") {
+            collectors.push(Box::new(LlamaCppCollector::new()));
+        }
+        if !is_hidden("vllm") {
+            collectors.push(Box::new(VllmCollector::new()));
         }
         if !is_hidden("opencode") {
             collectors.push(Box::new(OpenCodeCollector::new()));
         }
-        let codex_enabled = !is_hidden("codex");
+        let codex_enabled = false;
         Self {
             collectors,
             codex_enabled,
@@ -387,13 +406,7 @@ impl MultiCollector {
             shared.mcp_owned_rollouts = detection.owned_rollouts;
         }
 
-        if self.codex_enabled {
-            let desktop_pids = CodexCollector::find_codex_desktop_pids_from_shared(
-                &shared.process_info,
-                &shared.mcp_server_pids,
-            );
-            shared.desktop_rollout_fd_map = self.desktop_rollout_scanner.update(&desktop_pids);
-        }
+
 
         let mut all = Vec::new();
         for collector in &mut self.collectors {
@@ -491,34 +504,35 @@ mod tests {
     #[test]
     fn with_hidden_empty_keeps_all_collectors() {
         let mc = MultiCollector::with_hidden(&[]);
+        assert_eq!(mc.collectors.len(), 4);
+    }
+
+    #[test]
+    fn with_hidden_ollama_drops_ollama_only() {
+        let mc = MultiCollector::with_hidden(&["ollama".to_string()]);
         assert_eq!(mc.collectors.len(), 3);
     }
 
     #[test]
-    fn with_hidden_codex_drops_codex_only() {
-        let mc = MultiCollector::with_hidden(&["codex".to_string()]);
-        assert_eq!(mc.collectors.len(), 2);
-    }
-
-    #[test]
     fn with_hidden_is_case_insensitive() {
-        let mc = MultiCollector::with_hidden(&["CODEX".to_string()]);
-        assert_eq!(mc.collectors.len(), 2);
-        let mc = MultiCollector::with_hidden(&["Claude".to_string()]);
-        assert_eq!(mc.collectors.len(), 2);
+        let mc = MultiCollector::with_hidden(&["OLLAMA".to_string()]);
+        assert_eq!(mc.collectors.len(), 3);
+        let mc = MultiCollector::with_hidden(&["Llama.cpp".to_string()]);
+        assert_eq!(mc.collectors.len(), 3);
     }
 
     #[test]
     fn with_hidden_unknown_names_are_ignored() {
         let mc = MultiCollector::with_hidden(&["kiro".to_string(), "gemini".to_string()]);
-        assert_eq!(mc.collectors.len(), 3);
+        assert_eq!(mc.collectors.len(), 4);
     }
 
     #[test]
     fn with_hidden_all_agents_yields_empty() {
         let mc = MultiCollector::with_hidden(&[
-            "claude".to_string(),
-            "codex".to_string(),
+            "ollama".to_string(),
+            "llama.cpp".to_string(),
+            "vllm".to_string(),
             "opencode".to_string(),
         ]);
         assert!(mc.collectors.is_empty());

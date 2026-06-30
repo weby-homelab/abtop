@@ -1,16 +1,16 @@
 [package]
-name = "abtop"
-version = "0.4.8"
+name = "llm-top"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.88"
-description = "AI agent monitor for your terminal"
-license = "MIT"
-repository = "https://github.com/graykode/abtop"
-homepage = "https://github.com/graykode/abtop"
-keywords = ["tui", "monitor", "claude", "ai", "agent"]
+description = "htop for local LLMs (Ollama, llama.cpp, vLLM, OpenCode)"
+license = "GPL-3.0"
+repository = "https://github.com/weby-homelab/llm-top"
+homepage = "https://github.com/weby-homelab/llm-top"
+keywords = ["tui", "monitor", "llm", "ollama", "localllm"]
 categories = ["command-line-utilities"]
 readme = "README.md"
-authors = ["Tae Hwan Jung <nlkey2022@gmail.com>"]
+authors = ["weby-homelab <rekvizitor.ua@gmail.com>"]
 exclude = ["assets/*", "assets/**/*"]
 
 [dependencies]
