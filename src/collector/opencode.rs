@@ -1,5 +1,5 @@
 use super::{process, context_window_for_model};
-use crate::model::{AgentSession, ChildProcess, SessionStatus};
+use crate::model::{AgentSession, ChildProcess, SessionStatus, ChatMessage, ToolCall, ChatRole};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Maximum sessions to fetch from the DB per query.
-const MAX_SESSIONS: u32 = 20;
+const MAX_SESSIONS: u32 = 50;
 
 /// Collector for OpenCode sessions.
 ///
@@ -18,16 +18,23 @@ const MAX_SESSIONS: u32 = 20;
 ///
 /// Uses `sqlite3 -readonly -json` for safe concurrent reads (WAL mode).
 /// DB rows are cached and only refreshed on `shared.slow_tick` (every ~10s)
-/// so we don't fork a sqlite3 process every 2s. PID matching, status
-/// derivation and the children walk run every tick using live process info.
+/// OR when the database file/WAL modification time changes, enabling instant updates.
 pub struct OpenCodeCollector {
     db_path: PathBuf,
     /// Whether sqlite3 CLI is available (checked once).
     sqlite3_available: Option<bool>,
-    /// Cached DB rows from the last slow-tick query. Reused on fast ticks.
+    /// Cached DB rows from the last slow-tick or mtime-change query. Reused on fast ticks.
     cached_db_sessions: Vec<DbSession>,
     /// Cached DB subagent rows from the last slow-tick query.
     cached_db_subagents: Vec<DbSubAgent>,
+    /// Cached chat messages by session ID.
+    cached_chat_messages: HashMap<String, Vec<ChatMessage>>,
+    /// Cached tool calls by session ID.
+    cached_tool_calls: HashMap<String, Vec<ToolCall>>,
+    /// Last modification time of the DB file.
+    last_db_mtime: Option<std::time::SystemTime>,
+    /// Last modification time of the WAL file.
+    last_wal_mtime: Option<std::time::SystemTime>,
     /// Whether the "sqlite3 missing" warning has been emitted (once).
     #[cfg(target_os = "windows")]
     warned_sqlite3_missing: bool,
@@ -46,6 +53,10 @@ impl OpenCodeCollector {
             sqlite3_available: None,
             cached_db_sessions: Vec::new(),
             cached_db_subagents: Vec::new(),
+            cached_chat_messages: HashMap::new(),
+            cached_tool_calls: HashMap::new(),
+            last_db_mtime: None,
+            last_wal_mtime: None,
             #[cfg(target_os = "windows")]
             warned_sqlite3_missing: false,
         }
@@ -76,6 +87,8 @@ impl OpenCodeCollector {
         if is_symlink(&self.db_path) || !self.db_path.exists() {
             self.cached_db_sessions.clear();
             self.cached_db_subagents.clear();
+            self.cached_chat_messages.clear();
+            self.cached_tool_calls.clear();
             return vec![];
         }
         if !self.check_sqlite3() {
@@ -94,6 +107,8 @@ impl OpenCodeCollector {
             }
             self.cached_db_sessions.clear();
             self.cached_db_subagents.clear();
+            self.cached_chat_messages.clear();
+            self.cached_tool_calls.clear();
             return vec![];
         }
 
@@ -109,14 +124,43 @@ impl OpenCodeCollector {
             })
             .collect();
 
-        // Refresh DB rows on slow ticks only; reuse cache on fast ticks so
-        // we don't fork sqlite3 every 2s.
-        if shared.slow_tick {
+        // Check if DB or WAL modification times changed
+        let mut db_changed = false;
+        if let Ok(meta) = std::fs::metadata(&self.db_path) {
+            if let Ok(mtime) = meta.modified() {
+                if self.last_db_mtime.map_or(true, |last| mtime > last) {
+                    self.last_db_mtime = Some(mtime);
+                    db_changed = true;
+                }
+            }
+        }
+        let wal_path = self.db_path.with_extension("db-wal");
+        if let Ok(meta) = std::fs::metadata(&wal_path) {
+            if let Ok(mtime) = meta.modified() {
+                if self.last_wal_mtime.map_or(true, |last| mtime > last) {
+                    self.last_wal_mtime = Some(mtime);
+                    db_changed = true;
+                }
+            }
+        }
+
+        // Refresh DB rows on slow ticks or when the database actually changed
+        if shared.slow_tick || db_changed {
             if let Some(rows) = self.query_sessions() {
                 self.cached_db_sessions = rows;
             }
             if let Some(sub_rows) = self.query_subagents() {
                 self.cached_db_subagents = sub_rows;
+            }
+
+            let sids: Vec<String> = self.cached_db_sessions.iter().map(|s| s.id.clone()).collect();
+            if let Some(parts_map) = self.query_parts(&sids) {
+                self.cached_chat_messages.clear();
+                self.cached_tool_calls.clear();
+                for (sid, (chat, tools)) in parts_map {
+                    self.cached_chat_messages.insert(sid.clone(), chat);
+                    self.cached_tool_calls.insert(sid, tools);
+                }
             }
         }
 
@@ -137,17 +181,21 @@ impl OpenCodeCollector {
             let proc = shared.process_info.get(&matched_pid);
             let mem_mb = proc.map(|p| p.rss_kb / 1024).unwrap_or(0);
 
-            let age_ms = now_ms.saturating_sub(ds.time_updated);
-            let since_update_secs = age_ms / 1000;
-            let status = if since_update_secs < 30 {
+            // Precise status derivation from database message history:
+            // 1. If last message role is "user", model is thinking.
+            // 2. If last message role is "assistant" but completed time is not set, model is thinking.
+            // 3. Fallback to CPU usage check if a tool is executing but DB hasn't been committed yet.
+            let status = if ds.last_role == "user" {
+                SessionStatus::Thinking
+            } else if ds.last_role == "assistant" && ds.last_completed.is_none() {
                 SessionStatus::Thinking
             } else {
-                let cpu_active = proc.is_some_and(|p| p.cpu_pct > 1.0);
+                let cpu_active = proc.is_some_and(|p| p.cpu_pct > 5.0);
                 let has_active_child = process::has_active_descendant(
                     matched_pid,
                     &shared.children_map,
                     &shared.process_info,
-                    5.0,
+                    10.0,
                 );
                 if cpu_active || has_active_child {
                     SessionStatus::Thinking
@@ -212,6 +260,9 @@ impl OpenCodeCollector {
                 0.0
             };
 
+            let chat_messages = self.cached_chat_messages.get(&ds.id).cloned().unwrap_or_default();
+            let tool_calls = self.cached_tool_calls.get(&ds.id).cloned().unwrap_or_default();
+
             sessions.push(AgentSession {
                 agent_cli: "opencode",
                 pid: matched_pid,
@@ -264,9 +315,14 @@ impl OpenCodeCollector {
                 mem_line_count: 0,
                 children,
                 initial_prompt: ds.title.clone(),
-                first_assistant_text: String::new(),
-                chat_messages: vec![],
-                tool_calls: vec![],
+                first_assistant_text: {
+                    chat_messages.iter()
+                        .find(|m| m.role == ChatRole::Assistant)
+                        .map(|m| m.text.clone())
+                        .unwrap_or_default()
+                },
+                chat_messages,
+                tool_calls,
                 pending_since_ms: 0,
                 thinking_since_ms: 0,
                 file_accesses: vec![],
@@ -280,22 +336,38 @@ impl OpenCodeCollector {
         sessions
     }
 
+    /// Find running opencode processes, excluding subagent processes
+    /// (descendants that are also binaries of name "opencode").
     fn find_opencode_pids(process_info: &HashMap<u32, process::ProcInfo>) -> Vec<u32> {
-        process_info
-            .iter()
-            .filter(|(_, info)| {
-                process::cmd_has_binary(&info.command, "opencode") && !info.command.contains("grep")
-            })
-            .map(|(pid, _)| *pid)
-            .collect()
+        let mut pids = Vec::new();
+        for (&pid, info) in process_info {
+            if process::cmd_has_binary(&info.command, "opencode") && !info.command.contains("grep") {
+                // Traverse ancestor chain to verify it is the root opencode process
+                let mut is_subagent = false;
+                let mut curr_ppid = info.ppid;
+                while curr_ppid > 1 {
+                    if let Some(parent_info) = process_info.get(&curr_ppid) {
+                        if process::cmd_has_binary(&parent_info.command, "opencode") {
+                            is_subagent = true;
+                            break;
+                        }
+                        curr_ppid = parent_info.ppid;
+                    } else {
+                        break;
+                    }
+                }
+                if !is_subagent {
+                    pids.push(pid);
+                }
+            }
+        }
+        pids
     }
 
     /// Match a running PID to a session by comparing its working directory
     /// with the DB session's `directory`, falling back to a command-line
     /// substring match. Returns `None` if no PID's cwd or command line ties
-    /// to this session — we deliberately do not fall back to "the only
-    /// opencode process" here, because that would mark every DB row as
-    /// alive whenever a single opencode is running in an unrelated dir.
+    /// to this session.
     #[cfg(test)]
     fn match_pid_to_session(pid_commands: &HashMap<u32, &str>, session_dir: &str) -> Option<u32> {
         Self::match_pid_to_session_excluding(pid_commands, session_dir, &HashSet::new())
@@ -388,7 +460,13 @@ SELECT
   COALESCE((SELECT json_extract(m2.data, '$.providerID')
     FROM message m2 WHERE m2.session_id = s.id
     AND json_extract(m2.data, '$.role') = 'assistant'
-    ORDER BY m2.time_created DESC LIMIT 1), '') as provider
+    ORDER BY m2.time_created DESC LIMIT 1), '') as provider,
+  COALESCE((SELECT json_extract(m2.data, '$.role')
+    FROM message m2 WHERE m2.session_id = s.id
+    ORDER BY m2.time_created DESC LIMIT 1), '') as last_role,
+  (SELECT json_extract(m2.data, '$.time.completed')
+    FROM message m2 WHERE m2.session_id = s.id
+    ORDER BY m2.time_created DESC LIMIT 1) as last_completed
 FROM session s
 ORDER BY s.time_updated DESC
 LIMIT {};"#,
@@ -400,7 +478,7 @@ LIMIT {};"#,
         let model_rows = self.run_query(&model_sql).unwrap_or_default();
 
         // Build model lookup by session id
-        let mut model_map: HashMap<String, (String, String)> = HashMap::new();
+        let mut model_map: HashMap<String, (String, String, String, Option<u64>)> = HashMap::new();
         for mr in &model_rows {
             if let Some(id) = mr["id"].as_str() {
                 model_map.insert(
@@ -408,6 +486,8 @@ LIMIT {};"#,
                     (
                         sanitize_db_field(mr["model"].as_str().unwrap_or(""), 256),
                         sanitize_db_field(mr["provider"].as_str().unwrap_or(""), 256),
+                        sanitize_db_field(mr["last_role"].as_str().unwrap_or(""), 64),
+                        mr["last_completed"].as_u64(),
                     ),
                 );
             }
@@ -416,7 +496,9 @@ LIMIT {};"#,
         let mut sessions = Vec::new();
         for row in rows {
             let id = row["id"].as_str().unwrap_or("").to_string();
-            let (model, provider) = model_map.remove(&id).unwrap_or_default();
+            let (model, provider, last_role, last_completed) = model_map
+                .remove(&id)
+                .unwrap_or_else(|| ("".to_string(), "".to_string(), "".to_string(), None));
 
             // Sanitize DB-sourced strings before they reach the TUI/JSON snapshot.
             let title = sanitize_db_title(row["title"].as_str().unwrap_or(""));
@@ -440,6 +522,8 @@ LIMIT {};"#,
                 total_cache_write: row["total_cache_write"].as_u64().unwrap_or(0),
                 model,
                 provider,
+                last_role,
+                last_completed,
             });
         }
 
@@ -475,6 +559,92 @@ LIMIT {};"#,
             });
         }
         Some(subagents)
+    }
+
+    /// Query dialogue text messages and tool calls for active sessions.
+    fn query_parts(&self, session_ids: &[String]) -> Option<HashMap<String, (Vec<ChatMessage>, Vec<ToolCall>)>> {
+        if session_ids.is_empty() {
+            return Some(HashMap::new());
+        }
+        let formatted_ids: Vec<String> = session_ids.iter().map(|id| format!("'{}'", id)).collect();
+        let sql = format!(
+            r#"
+SELECT
+  p.session_id,
+  json_extract(m.data, '$.role') as role,
+  p.data as part_data
+FROM part p
+JOIN message m ON p.message_id = m.id
+WHERE p.session_id IN ({})
+ORDER BY p.time_created ASC;"#,
+            formatted_ids.join(",")
+        );
+
+        let rows = self.run_query(&sql)?;
+        let mut map: HashMap<String, (Vec<ChatMessage>, Vec<ToolCall>)> = HashMap::new();
+        for id in session_ids {
+            map.insert(id.clone(), (Vec::new(), Vec::new()));
+        }
+
+        for row in rows {
+            let session_id = row["session_id"].as_str().unwrap_or("").to_string();
+            let role_str = row["role"].as_str().unwrap_or("");
+            let part_data_str = row["part_data"].as_str().unwrap_or("");
+
+            if let Some((chat, tools)) = map.get_mut(&session_id) {
+                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(part_data_str) {
+                    let part_type = obj["type"].as_str().unwrap_or("");
+                    if part_type == "text" || part_type == "reasoning" {
+                        if let Some(text) = obj["text"].as_str() {
+                            if !text.trim().is_empty() {
+                                let role = if role_str == "user" {
+                                    ChatRole::User
+                                } else {
+                                    ChatRole::Assistant
+                                };
+                                let redacted_text = super::redact_secrets(&super::sanitize_terminal_text(text));
+                                chat.push(ChatMessage {
+                                    role,
+                                    text: redacted_text,
+                                });
+                            }
+                        }
+                    } else if part_type == "tool" {
+                        let name = obj["tool"].as_str().unwrap_or("").to_string();
+                        if !name.is_empty() {
+                            let mut arg = String::new();
+                            if let Some(input) = obj["state"]["input"].as_object() {
+                                if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+                                    arg = cmd.to_string();
+                                } else if let Some(path) = input.get("filePath").and_then(|v| v.as_str()) {
+                                    arg = path.to_string();
+                                } else if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+                                    arg = path.to_string();
+                                } else if let Some(pattern) = input.get("pattern").and_then(|v| v.as_str()) {
+                                    arg = pattern.to_string();
+                                } else if let Some(desc) = input.get("description").and_then(|v| v.as_str()) {
+                                    arg = desc.to_string();
+                                } else if !input.is_empty() {
+                                    if let Some(first_val) = input.values().next().and_then(|v| v.as_str()) {
+                                        arg = first_val.to_string();
+                                    }
+                                }
+                            }
+                            let start = obj["state"]["time"]["start"].as_u64().unwrap_or(0);
+                            let end = obj["state"]["time"]["end"].as_u64().unwrap_or(0);
+                            let duration_ms = end.saturating_sub(start);
+                            tools.push(ToolCall {
+                                name,
+                                arg,
+                                duration_ms,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(map)
     }
 }
 
@@ -549,6 +719,8 @@ struct DbSession {
     total_cache_write: u64,
     model: String,
     provider: String,
+    last_role: String,
+    last_completed: Option<u64>,
 }
 
 /// Check if a path is a symlink (fail-closed: returns true on error).
@@ -710,10 +882,23 @@ mod tests {
                 command: "node /usr/bin/opencode run test".to_string(),
             },
         );
+        // Add a subagent process of PID 100 (should be filtered out)
+        info.insert(
+            400,
+            process::ProcInfo {
+                pid: 400,
+                ppid: 100,
+                rss_kb: 300,
+                cpu_pct: 0.0,
+                command: "/home/user/.opencode/bin/opencode subagent".to_string(),
+            },
+        );
+
         let pids = OpenCodeCollector::find_opencode_pids(&info);
         assert!(pids.contains(&100));
         assert!(!pids.contains(&200)); // grep excluded
         assert!(pids.contains(&300));
+        assert!(!pids.contains(&400)); // subagent excluded (parent is opencode)
         assert_eq!(pids.len(), 2);
     }
 
